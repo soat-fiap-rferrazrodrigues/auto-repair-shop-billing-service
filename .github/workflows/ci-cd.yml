@@ -39,6 +39,16 @@ jobs:
       - name: Unit tests (fails below 80% coverage)
         run: npm run test:cov
 
+      - name: Coverage evidence (job summary + artifact)
+        if: always()
+        run: node scripts/coverage-summary.js >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+
       - name: SonarQube scan + quality gate
         uses: SonarSource/sonarqube-scan-action@v5
         env:
@@ -82,8 +92,12 @@ jobs:
     environment: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
     env:
       CLUSTER: ${{ github.ref_name == 'main' && 'auto-repair-prod' || 'auto-repair-homolog' }}
+      ENV: ${{ github.ref_name == 'main' && 'prod' || 'homolog' }}
+      API_HOST: ${{ vars.API_HOST }}
       IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
@@ -91,15 +105,23 @@ jobs:
 
       - run: aws eks update-kubeconfig --name $CLUSTER --region $AWS_REGION
 
+      # Manifests live in k8s/; ${ACCOUNT_ID} ${ENV} ${API_HOST} ${IMAGE} are filled here.
+      - name: Apply config (ServiceAccount, ConfigMap, ExternalSecret, Service)
+        run: |
+          export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          envsubst '${ACCOUNT_ID} ${ENV} ${API_HOST} ${IMAGE}' < k8s/00-config.yaml | kubectl apply -f -
+          kubectl wait --for=condition=Ready externalsecret/billing-service-secrets --timeout=120s
+
       - name: Run database migrations
         run: |
           kubectl delete pod billing-migrate --ignore-not-found
           kubectl run billing-migrate --image=$IMAGE --restart=Never --rm -i \
             --overrides='{"spec":{"containers":[{"name":"billing-migrate","image":"'"$IMAGE"'","command":["npm","run","migration:run"],"envFrom":[{"secretRef":{"name":"billing-service-secrets"}}]}]}}'
 
-      - name: Roll out
+      - name: Roll out (Deployment + HPA)
         run: |
-          kubectl set image deployment/$DEPLOYMENT billing=$IMAGE
+          export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          envsubst '${ACCOUNT_ID} ${ENV} ${API_HOST} ${IMAGE}' < k8s/10-deployment.yaml | kubectl apply -f -
           kubectl rollout status deployment/$DEPLOYMENT --timeout=180s
 
       - name: Smoke test
